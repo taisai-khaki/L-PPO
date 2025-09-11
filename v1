@@ -1,0 +1,1719 @@
+#
+# Full Python implementation of the research paper:
+# "From Stability to Viability in Supply Chains via Reinforcement Learning"
+#
+# This script includes:
+# 1. A multi-echelon supply chain simulation environment with a hierarchical action space,
+#    ARIMA-like demand model, stochastic lead times, advanced viability indicators,
+#    and a complete tiered disruption model.
+# 2. A full suite of agents for comparison:
+#    - L-PPO (Lagrangian-Proximal Policy Optimization)
+#    - RS-PPO (Reward-Shaped PPO)
+#    - DQN (Deep Q-Network)
+#    - SP (Stochastic Programming Heuristic)
+# 3. A comprehensive Experiment Runner for training, evaluation, and analysis.
+# 4. Calculation of Maturity Indices (TTR, TTA) and other key performance metrics.
+# 5. Serialization of results, logs, and models for reproducibility.
+#
+
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.distributions import Categorical
+from torch.optim import Adam
+import networkx as nx
+import random
+import collections
+import math
+import os
+import pickle
+import pandas as pd
+import time
+import matplotlib.pyplot as plt
+import logging
+from scipy.stats import truncnorm, geom, norm
+import seaborn as sns
+
+# --- Configuration ---
+class Config:
+    # Environment settings
+    N_SUPPLIERS = 6
+    N_PLANTS = 3
+    N_DCS = 3
+    N_CUSTOMERS = 10
+    N_PRODUCTS = 3
+    MAX_STOCK_PER_PROD = 500
+    ACTION_LEVELS = 10
+
+    # Demand Model
+    DEMAND_BASE = 20
+    DEMAND_AUTOREGRESSIVE_COEF = 0.6
+    DEMAND_MA_COEF = 0.2
+    DEMAND_STD = 2.5
+    DEMAND_SEASONALITY_PERIOD = 50
+    DEMAND_SEASONALITY_AMPLITUDE = 15
+
+    # Lead Time Settings
+    LEAD_TIME_GAMMA_SHAPE = 2.0
+
+    # Disruption Settings
+    NODE_DISRUPTION_PROB = 0.01
+    NODE_DISRUPTION_DURATION = 10
+    REGIONAL_DISRUPTION_PROB = 0.01
+    GEOM_P = 0.2
+    SEVERITY_MEAN = 0.6
+    SEVERITY_STD = 0.1
+    FOCAL_ZONE = "NA"
+    STRUCTURAL_SHIFT_TIME = 150
+    INTERNATIONAL_COST_INCREASE_FACTOR = 2.0
+
+    # Viability & Irreversibility Settings
+    FINANCIAL_HEALTH_DECAY_RATE = 0.05
+    FINANCIAL_HEALTH_RECOVERY_RATE = 0.01
+    FINANCIAL_BANKRUPTCY_THRESHOLD = 0.2
+    FINANCIAL_DISTRESS_STEPS = 6
+    GEO_RISK_THRESHOLD = 0.8
+    GEO_RISK_STEPS = 4
+    GEO_RISK_DRIFT = 0.02
+    CONNECTIVITY_COLLAPSE_THRESHOLD = 0.1
+
+    # Cost & Reward Settings
+    HOLDING_COST_RATE = 0.05
+    STOCKOUT_PENALTY_RATE = 5
+    TRANSPORTATION_COST_RATE = 0.01
+    RS_PPO_PENALTY = -5000  # Penalty for RS-PPO agent on collapse
+
+    # L-PPO Agent Hyperparameters
+    GAMMA = 0.99
+    LEARNING_RATE_ACTOR = 3e-5
+    LEARNING_RATE_CRITIC = 1e-4
+    LEARNING_RATE_DUAL = 1e-3
+    PPO_EPOCHS = 10
+    PPO_CLIP = 0.2
+    GAE_LAMBDA = 0.95
+    ENTROPY_COEF = 0.01
+    COST_LIMIT = 0.01
+    LAMBDA_MAX = 20.0
+    DUAL_UPDATE_FREQ = 4
+
+    # DQN Agent Hyperparameters
+    DQN_LEARNING_RATE = 1e-4
+    DQN_BATCH_SIZE = 128
+    DQN_BUFFER_SIZE = 50000
+    DQN_EPSILON_START = 1.0
+    DQN_EPSILON_END = 0.05
+    DQN_EPSILON_DECAY = 10000
+    DQN_TARGET_UPDATE_FREQ = 1000
+
+    # SP Heuristic Settings
+    SP_HORIZON = 10
+    SP_SCENARIOS = 5
+
+    # Training & Evaluation settings
+    SEED = 42
+    MAX_TIMESTEPS = 600
+    NUM_TRAINING_EPISODES = 1000  # Reduced for faster demonstration
+    NUM_EVALUATION_EPISODES = 20
+    ROLLOUT_STEPS = 512
+    SERVICE_LEVEL_THRESHOLD = 0.95
+    TTA_STABILITY_WINDOW = 20  # Window to check for policy stabilization
+
+
+class BaseAgent:
+    def __init__(self, env, config):
+        self.env = env
+        self.config = config
+
+    def select_action(self, state):
+        raise NotImplementedError
+
+    def update(self, *args, **kwargs):
+        pass
+
+    def store_transition(self, *args, **kwargs):
+        pass
+
+    def save(self, filepath):
+        pass
+
+    def load(self, filepath):
+        pass
+
+
+class ReplayBuffer:
+    def __init__(self, capacity, state_dim, action_dim):
+        self.capacity = capacity
+        self.states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions = np.zeros((capacity,), dtype=np.int64)
+        self.rewards = np.zeros((capacity,), dtype=np.float32)
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones = np.zeros((capacity,), dtype=np.bool_)
+        self.idx = 0
+        self.size = 0
+
+    def store(self, state, action, reward, next_state, done):
+        idx = self.idx
+        self.states[idx] = state
+        self.actions[idx] = action
+        self.rewards[idx] = reward
+        self.next_states[idx] = next_state
+        self.dones[idx] = done
+        self.idx = (self.idx + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size):
+        assert self.size >= batch_size
+        indices = np.random.choice(self.size, batch_size, replace=False)
+        return (
+            torch.FloatTensor(self.states[indices]),
+            torch.LongTensor(self.actions[indices]),
+            torch.FloatTensor(self.rewards[indices]),
+            torch.FloatTensor(self.next_states[indices]),
+            torch.FloatTensor(self.dones[indices])
+        )
+
+
+class DQNNet(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(state_dim, 256), nn.ReLU(),
+            nn.Linear(256, 256), nn.ReLU(),
+            nn.Linear(256, action_dim)
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class ActorCritic(nn.Module):
+    def __init__(self, state_dim, hierarchical_action_space):
+        super().__init__()
+        self.body = nn.Sequential(nn.Linear(state_dim, 256), nn.ReLU(), nn.Linear(256, 256), nn.ReLU())
+        self.strat_head = nn.Linear(256, hierarchical_action_space.spaces[0].n)
+        self.prod_level_heads = nn.ModuleList([nn.Linear(256, n) for n in hierarchical_action_space.spaces[1].nvec])
+        self.route_head = nn.Linear(256, hierarchical_action_space.spaces[2].n)
+        self.critic_r = nn.Linear(256, 1)
+        self.critic_c = nn.Linear(256, 1)
+
+    def forward(self, state):
+        x = self.body(state)
+
+        # Calculate actor and reward critic outputs as before
+        actor_logits = (self.strat_head(x), [h(x) for h in self.prod_level_heads], self.route_head(x))
+        value_r = self.critic_r(x)
+
+        # MODIFICATION: Only call the cost critic if it exists
+        value_c = self.critic_c(x) if self.critic_c is not None else None
+
+        return actor_logits, value_r, value_c
+
+    def actor_params(self):
+        return list(self.body.parameters()) + list(self.strat_head.parameters()) + \
+            list(self.prod_level_heads.parameters()) + list(self.route_head.parameters())
+
+    def critic_r_params(self): return self.critic_r.parameters()
+
+    def critic_c_params(self): return self.critic_c.parameters()
+
+
+class LPPOAgent(BaseAgent):
+    def __init__(self, env, config_obj):
+        super().__init__(env, config_obj)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.policy = ActorCritic(env.observation_space.shape[0], env.hierarchical_action_space).to(self.device)
+        self.actor_optimizer = Adam(self.policy.actor_params(), lr=config_obj.LEARNING_RATE_ACTOR)
+        self.critic_r_optimizer = Adam(self.policy.critic_r_params(), lr=config_obj.LEARNING_RATE_CRITIC)
+        self.critic_c_optimizer = Adam(self.policy.critic_c_params(), lr=config_obj.LEARNING_RATE_CRITIC)
+        self.lambda_val = torch.tensor(1.0, requires_grad=True, device=self.device)
+        self.lambda_optimizer = Adam([self.lambda_val], lr=config_obj.LEARNING_RATE_DUAL)
+        self.buffer = collections.defaultdict(list)
+
+    def select_action(self, state):
+        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+        with torch.no_grad(): (s_logits, p_logits, r_logits), v_r, v_c = self.policy(state)
+        s_dist, p_dists, r_dist = Categorical(logits=s_logits), [Categorical(logits=l) for l in p_logits], Categorical(
+            logits=r_logits)
+        a_s, a_p, a_r = s_dist.sample(), torch.stack([d.sample() for d in p_dists]), r_dist.sample()
+        log_p = (s_dist.log_prob(a_s) + torch.stack(
+            [d.log_prob(a) for d, a in zip(p_dists, a_p)]).sum() + r_dist.log_prob(a_r)).item()
+        return (a_s.item(), a_p.cpu().numpy(), a_r.item()), log_p, v_r.item(), v_c.item()
+
+    def store_transition(self, s, a, r, done, cost, log_p, v_r, v_c):
+        # Normalize and store tensors / floats safely.
+        # States: keep as torch tensors (we stack them later)
+        self.buffer['states'].append(torch.FloatTensor(s))
+
+        # Actions, rewards, costs, dones as before
+        self.buffer['actions'].append(a)
+        self.buffer['rewards'].append(float(r))
+        self.buffer['costs'].append(float(cost))
+        self.buffer['dones'].append(float(done))
+
+        # log_p may be a torch.Tensor or a float. Store as plain float.
+        if isinstance(log_p, torch.Tensor):
+            try:
+                lp_val = float(log_p.detach().cpu().item())
+            except Exception:
+                # fallback if log_p is a tensor with more than 1 element
+                lp_val = float(log_p.detach().cpu().numpy().ravel()[0])
+        else:
+            lp_val = float(log_p)
+        self.buffer['log_probs'].append(lp_val)
+
+        # values v_r and v_c are typically floats (v.item()) but handle tensors too
+        if isinstance(v_r, torch.Tensor):
+            v_r_val = float(v_r.detach().cpu().item())
+        else:
+            v_r_val = float(v_r)
+        if isinstance(v_c, torch.Tensor):
+            v_c_val = float(v_c.detach().cpu().item())
+        else:
+            v_c_val = float(v_c)
+
+        self.buffer['values_r'].append(v_r_val)
+        self.buffer['values_c'].append(v_c_val)
+
+    def clear_buffer(self):
+        self.buffer.clear()
+
+    def update(self, update_idx):
+        states = torch.stack(self.buffer['states']).to(self.device)
+        old_log_ps = torch.tensor(self.buffer['log_probs'], dtype=torch.float32).to(self.device)
+        a_s = torch.tensor([a[0] for a in self.buffer['actions']], device=self.device)
+        a_p = torch.tensor(np.array([a[1] for a in self.buffer['actions']]), device=self.device)
+        a_r = torch.tensor([a[2] for a in self.buffer['actions']], device=self.device)
+        r, c, d, v_r, v_c = [self.buffer[k] for k in ('rewards', 'costs', 'dones', 'values_r', 'values_c')]
+
+        adv_r, ret_r = self.compute_gae(r, d, v_r)
+        adv_c, ret_c = self.compute_gae(c, d, v_c)
+
+        adv_r = ((adv_r - adv_r.mean()) / (adv_r.std() + 1e-8)).detach()
+        adv_c = ((adv_c - adv_c.mean()) / (adv_c.std() + 1e-8)).detach()
+        ret_r = ret_r.detach()
+        ret_c = ret_c.detach()
+
+        advs = (adv_r - self.lambda_val.detach() * adv_c).detach()
+
+        for _ in range(self.config.PPO_EPOCHS):
+            (s_l, p_l, r_l), s_v_r, s_v_c = self.policy(states)
+            s_d, p_d, r_d = Categorical(logits=s_l), [Categorical(logits=l) for l in p_l], Categorical(logits=r_l)
+            lp_s, lp_p, lp_r = s_d.log_prob(a_s), torch.stack([d.log_prob(a_p[:, i]) for i, d in enumerate(p_d)]).sum(
+                dim=0), r_d.log_prob(a_r)
+            new_log_ps = lp_s + lp_p + lp_r
+            ratios = torch.exp(new_log_ps - old_log_ps)
+            s1, s2 = ratios * advs, torch.clamp(ratios, 1 - self.config.PPO_CLIP, 1 + self.config.PPO_CLIP) * advs
+            ent = (s_d.entropy() + sum(d.entropy() for d in p_d) + r_d.entropy()).mean()
+
+            p_loss = -torch.min(s1, s2).mean() - self.config.ENTROPY_COEF * ent
+            l_r = nn.MSELoss()(s_v_r.squeeze(), ret_r)
+            l_c = nn.MSELoss()(s_v_c.squeeze(), ret_c)
+
+            # 1. Zero out all gradients first
+            self.actor_optimizer.zero_grad()
+            self.critic_r_optimizer.zero_grad()
+            self.critic_c_optimizer.zero_grad()
+
+            # 2. Perform all backward passes to compute gradients
+            # The retain_graph=True fix is still needed!
+            p_loss.backward(retain_graph=True)
+            l_r.backward(retain_graph=True)
+            l_c.backward()
+
+            # 3. NOW, update all the weights using the computed gradients
+            self.actor_optimizer.step()
+            self.critic_r_optimizer.step()
+            self.critic_c_optimizer.step()
+
+        if update_idx % self.config.DUAL_UPDATE_FREQ == 0:
+            lambda_loss = -self.lambda_val * (torch.mean(ret_c) - self.config.COST_LIMIT).detach()
+            self.lambda_optimizer.zero_grad()
+            lambda_loss.backward()
+            self.lambda_optimizer.step()
+            self.lambda_val.data.clamp_(0, self.config.LAMBDA_MAX)
+
+    def compute_gae(self, rewards, dones, values):
+        advs, last_a = [], 0
+        # Correctly bootstrap the value of the state after the last one in the rollout
+        # This was a bug; it was previously hardcoded to 0.0.
+        last_v = values[-1]
+        for i in reversed(range(len(rewards))):
+            next_non_term = 1.0 - dones[i]
+            # Use the correct next value for GAE calculation
+            next_v = values[i + 1] if i < len(rewards) - 1 else last_v
+            delta = rewards[i] + self.config.GAMMA * next_v * next_non_term - values[i]
+            last_a = delta + self.config.GAMMA * self.config.GAE_LAMBDA * next_non_term * last_a
+            advs.insert(0, last_a)
+
+        # Convert to numpy array before creating a tensor to avoid performance warnings
+        advs_np = np.array(advs, dtype=np.float32)
+        values_np = np.array(values, dtype=np.float32)
+
+        advs = torch.from_numpy(advs_np).to(self.device)
+        rets = advs + torch.from_numpy(values_np).to(self.device)
+        return advs, rets
+
+    def save(self, fp):
+        torch.save(self.policy.state_dict(), fp)
+
+    def load(self, fp):
+        self.policy.load_state_dict(torch.load(fp, map_location=self.device))
+
+
+class RSPPOAgent(LPPOAgent):
+    # Same as LPPO but without cost critic and lambda
+    def __init__(self, env, config_obj):
+        super().__init__(env, config_obj)
+        # Remove cost-related components
+        self.policy.critic_c = None
+        self.critic_c_optimizer = None
+        self.lambda_val = None
+        self.lambda_optimizer = None
+
+    def select_action(self, state):
+        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+        with torch.no_grad():
+            (s_logits, p_logits, r_logits), v_r, _ = self.policy(state)  # Note: we ignore cost value
+        s_dist, p_dists, r_dist = Categorical(logits=s_logits), [Categorical(logits=l) for l in p_logits], Categorical(
+            logits=r_logits)
+        a_s, a_p, a_r = s_dist.sample(), torch.stack([d.sample() for d in p_dists]), r_dist.sample()
+        log_p = (s_dist.log_prob(a_s) + torch.stack(
+            [d.log_prob(a) for d, a in zip(p_dists, a_p)]).sum() + r_dist.log_prob(a_r)).item()
+        return (a_s.item(), a_p.cpu().numpy(), a_r.item()), log_p, v_r.item(), 0.0  # return 0 for v_c
+
+    def update(self, update_idx):
+        states = torch.stack(self.buffer['states']).to(self.device)
+        old_log_ps = torch.tensor(self.buffer['log_probs'], dtype=torch.float32).to(self.device)
+        a_s = torch.tensor([a[0] for a in self.buffer['actions']], device=self.device)
+        a_p = torch.tensor(np.array([a[1] for a in self.buffer['actions']]), device=self.device)
+        a_r = torch.tensor([a[2] for a in self.buffer['actions']], device=self.device)
+        r, d, v_r = [self.buffer[k] for k in ('rewards', 'dones', 'values_r')]
+
+        adv_r, ret_r = self.compute_gae(r, d, v_r)
+
+        advs = ((adv_r - adv_r.mean()) / (adv_r.std() + 1e-8)).detach()
+        ret_r = ret_r.detach()
+
+        for _ in range(self.config.PPO_EPOCHS):
+            (s_l, p_l, r_l), s_v_r, _ = self.policy(states)
+            s_d, p_d, r_d = Categorical(logits=s_l), [Categorical(logits=l) for l in p_l], Categorical(logits=r_l)
+            lp_s, lp_p, lp_r = s_d.log_prob(a_s), torch.stack([d.log_prob(a_p[:, i]) for i, d in enumerate(p_d)]).sum(
+                dim=0), r_d.log_prob(a_r)
+            new_log_ps = lp_s + lp_p + lp_r
+            ratios = torch.exp(new_log_ps - old_log_ps)
+            s1, s2 = ratios * advs, torch.clamp(ratios, 1 - self.config.PPO_CLIP, 1 + self.config.PPO_CLIP) * advs
+            ent = (s_d.entropy() + sum(d.entropy() for d in p_d) + r_d.entropy()).mean()
+
+            p_loss = -torch.min(s1, s2).mean() - self.config.ENTROPY_COEF * ent
+            l_r = nn.MSELoss()(s_v_r.squeeze(), ret_r)
+            self.actor_optimizer.zero_grad()
+            self.critic_r_optimizer.zero_grad()
+
+            p_loss.backward(retain_graph=True)
+            l_r.backward()
+
+            # 3. Update all weights
+            self.actor_optimizer.step()
+            self.critic_r_optimizer.step()
+
+
+class DQNAgent(BaseAgent):
+    def __init__(self, env, config_obj):
+        super().__init__(env, config_obj)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.q_net = DQNNet(env.observation_space.shape[0], env.flat_action_size).to(self.device)
+        self.target_net = DQNNet(env.observation_space.shape[0], env.flat_action_size).to(self.device)
+        self.target_net.load_state_dict(self.q_net.state_dict())
+        self.optimizer = Adam(self.q_net.parameters(), lr=config_obj.DQN_LEARNING_RATE)
+        self.replay_buffer = ReplayBuffer(config_obj.DQN_BUFFER_SIZE, env.observation_space.shape[0], 1)
+        self.epsilon = config_obj.DQN_EPSILON_START
+        self.steps_done = 0
+        # More frequent target updates for complex environments
+        self.target_update_freq = min(config_obj.DQN_TARGET_UPDATE_FREQ, 200)
+
+    def select_action(self, state):
+        """
+            Selects an action using an epsilon-greedy policy.
+            """
+        # Calculate epsilon with decay
+        self.epsilon = self.config.DQN_EPSILON_END + (self.config.DQN_EPSILON_START - self.config.DQN_EPSILON_END) * \
+                       math.exp(-1. * self.steps_done / self.config.DQN_EPSILON_DECAY)
+        self.steps_done += 1
+
+        # Epsilon-greedy action selection
+        if random.random() > self.epsilon:
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+                q_values = self.q_net(state_tensor)
+                action = q_values.max(1)[1].item()
+        else:
+            action = self.env.action_space.sample()
+
+        # The runner expects four return values. Return the action and placeholders.
+        return action, 0.0, 0.0, 0.0
+
+
+    def save(self, filepath):
+        """
+        Saves the Q-network's state dictionary.
+        """
+        torch.save(self.q_net.state_dict(), filepath)
+
+
+    def load(self, filepath):
+        """
+        Loads the Q-network's state dictionary.
+        """
+        self.q_net.load_state_dict(torch.load(filepath, map_location=self.device))
+        self.target_net.load_state_dict(self.q_net.state_dict())  # Sync target network
+
+    def update(self, *_):
+        if self.replay_buffer.size < self.config.DQN_BATCH_SIZE:
+            return
+
+        # Sample from replay buffer
+        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.config.DQN_BATCH_SIZE)
+        states, actions, rewards, next_states, dones = (
+            states.to(self.device), actions.to(self.device),
+            rewards.to(self.device), next_states.to(self.device),
+            dones.to(self.device)
+        )
+
+        # Compute Q values
+        q_values = self.q_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+
+        # Compute next Q values using target network
+        with torch.no_grad():
+            next_q_values = self.target_net(next_states).max(1)[0]
+            expected_q = rewards + (1 - dones) * self.config.GAMMA * next_q_values
+
+        # Compute loss
+        loss = nn.MSELoss()(q_values, expected_q.detach())
+
+        # Optimize
+        self.optimizer.zero_grad()
+        loss.backward()
+
+        # Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), 1.0)
+        self.optimizer.step()
+
+        # Update target network
+        if self.steps_done % self.target_update_freq == 0:
+            self.target_net.load_state_dict(self.q_net.state_dict())
+
+
+class SPAgent(BaseAgent):
+    def __init__(self, env, config_obj):
+        super().__init__(env, config_obj)
+        self.horizon = config_obj.SP_HORIZON
+        self.scenarios = config_obj.SP_SCENARIOS
+        self.demand_history = collections.deque(maxlen=50)
+
+    def select_action(self, state):
+        """
+        Implements a stochastic programming approach for supply chain optimization.
+        Uses a newsvendor-like model with demand forecasting and service level constraints.
+        """
+        # Extract current inventory from state
+        n_products = self.config.N_PRODUCTS
+        n_operational_nodes = len(self.env.operational_nodes)
+        inventory_start_idx = 0
+        inventory_end_idx = n_operational_nodes * n_products
+        inventory_flat = state[inventory_start_idx:inventory_end_idx]
+
+        # Reshape to node x product matrix
+        inventory = inventory_flat.reshape(n_operational_nodes, n_products)
+
+        # Calculate current inventory levels
+        current_inv = {node: inventory[i] for i, node in enumerate(self.env.operational_nodes)}
+
+        # Forecast demand using ARIMA-like model
+        demand_forecasts, forecast_errors = self._forecast_demand()
+
+        # Generate optimal order quantities using newsvendor model
+        optimal_actions = self._solve_newsvendor_model(current_inv, demand_forecasts, forecast_errors)
+
+        return optimal_actions, 0, 0, 0
+
+    def _forecast_demand(self):
+        """
+        Implements ARIMA-like demand forecasting.
+        Returns:
+            demand_forecasts: Dictionary of forecasted demand for each customer
+            forecast_errors: Standard errors of the forecasts
+        """
+        forecasts = {}
+        errors = {}
+
+        # Simple ARIMA implementation (in practice, use statsmodels)
+        for cust in self.env.customers:
+            # Use historical patterns to forecast
+            if len(self.demand_history) > 0:
+                # Simple moving average as baseline
+                historical_demands = np.array([d[cust] for d in self.demand_history])
+                mean_demand = np.mean(historical_demands, axis=0)
+                std_demand = np.std(historical_demands, axis=0)
+
+                # Add seasonality and trend
+                seasonal_component = self.config.DEMAND_SEASONALITY_AMPLITUDE * np.sin(
+                    2 * np.pi * (len(self.demand_history) % self.config.DEMAND_SEASONALITY_PERIOD) /
+                    self.config.DEMAND_SEASONALITY_PERIOD
+                )
+
+                forecasts[cust] = mean_demand + seasonal_component
+                errors[cust] = std_demand
+            else:
+                # Default values if no history
+                forecasts[cust] = np.full(self.config.N_PRODUCTS, self.config.DEMAND_BASE)
+                errors[cust] = np.full(self.config.N_PRODUCTS, self.config.DEMAND_STD)
+
+        return forecasts, errors
+
+    def _solve_newsvendor_model(self, current_inv, demand_forecasts, forecast_errors):
+        """
+        Solves a newsvendor-like problem to determine optimal order quantities.
+
+        The newsvendor model minimizes:
+            E[cu * (D - Q)^+ + co * (Q - D)^+]
+        where:
+            cu = underage cost (stockout cost)
+            co = overage cost (holding cost)
+            D = demand (random variable)
+            Q = order quantity
+
+        For normal demand, the optimal solution is:
+            Q* = μ + Φ^{-1}(cu/(cu+co)) * σ
+        where Φ is the standard normal CDF.
+        """
+        # Calculate critical ratio for each product
+        critical_ratios = {}
+        for prod_idx in range(self.config.N_PRODUCTS):
+            cu = self.config.STOCKOUT_PENALTY_RATE  # Underage cost
+            co = self.config.HOLDING_COST_RATE  # Overage cost
+            critical_ratios[prod_idx] = cu / (cu + co)
+
+        # Determine optimal order quantities for each node
+        optimal_orders = {}
+        for node in self.env.plants + self.env.dcs:
+            if node not in self.env.G:
+                continue
+
+            # Calculate demand that this node needs to fulfill
+            downstream_demand = self._calculate_downstream_demand(node, demand_forecasts)
+            demand_std = self._calculate_downstream_demand_std(node, forecast_errors)
+
+            # Calculate optimal order quantity using newsvendor formula
+            optimal_orders[node] = np.zeros(self.config.N_PRODUCTS)
+            for prod_idx in range(self.config.N_PRODUCTS):
+                mu = downstream_demand[prod_idx]
+                sigma = demand_std[prod_idx]
+                cr = critical_ratios[prod_idx]
+
+                # Calculate z-score for critical ratio
+                z = norm.ppf(cr)
+
+                # Optimal order quantity
+                Q = mu + z * sigma
+
+                # Adjust for current inventory
+                current_stock = current_inv[node][prod_idx] if node in current_inv else 0
+                optimal_orders[node][prod_idx] = max(0, Q - current_stock)
+
+        # Convert optimal orders to action format
+        # This is a simplified mapping - in practice, you'd need a more sophisticated approach
+        avg_order_level = np.mean([np.mean(orders) for orders in optimal_orders.values()])
+        max_order = self.config.MAX_STOCK_PER_PROD
+
+        # Normalize to action levels
+        single_prod_level = np.clip(
+            (avg_order_level / max_order) * self.config.ACTION_LEVELS,
+            0, self.config.ACTION_LEVELS - 1
+        ).astype(int)
+        # Create a numpy array with that level for each product
+        prod_levels = np.full(self.config.N_PRODUCTS, single_prod_level)
+
+        # Choose strategy based on variability
+        demand_variability = np.mean([np.std(d) for d in demand_forecasts.values()])
+        if demand_variability > self.config.DEMAND_STD * 2:
+            strategy = 2  # Aggressive
+        elif demand_variability < self.config.DEMAND_STD * 0.5:
+            strategy = 0  # Conservative
+        else:
+            strategy = 1  # Normal
+
+        # Choose routing based on disruption state
+        has_disruptions = any(state[2] > 0 for state in self.env.disruption_state.values())
+        route_policy = 1 if has_disruptions else 0  # Time-based if disruptions, cost-based otherwise
+
+        return (strategy, prod_levels, route_policy)
+
+    def _calculate_downstream_demand(self, node, demand_forecasts):
+        """
+        Calculates the total demand that a node needs to fulfill.
+        """
+        if node in self.env.customers:
+            return demand_forecasts[node]
+
+        total_demand = np.zeros(self.config.N_PRODUCTS)
+        for successor in self.env.G.successors(node):
+            successor_demand = self._calculate_downstream_demand(successor, demand_forecasts)
+            total_demand += successor_demand
+
+        return total_demand
+
+    def _calculate_downstream_demand_std(self, node, forecast_errors):
+        """
+        Calculates the standard deviation of demand that a node needs to fulfill.
+        """
+        if node in self.env.customers:
+            return forecast_errors[node]
+
+        total_variance = np.zeros(self.config.N_PRODUCTS)
+        for successor in self.env.G.successors(node):
+            successor_std = self._calculate_downstream_demand_std(successor, forecast_errors)
+            total_variance += successor_std ** 2
+
+        return np.sqrt(total_variance)
+
+
+# --- Environment (Same as before, with minor additions) ---
+class SupplyChainEnv(gym.Env):
+    """
+    A multi-echelon supply chain simulation environment with hierarchical action space,
+    ARIMA-like demand model, stochastic lead times, and viability indicators.
+
+    Based on the research paper:
+    "From Stability to Viability in Supply Chains via Reinforcement Learning"
+
+    The environment models a supply chain with suppliers, plants, distribution centers, and customers.
+    It includes features like:
+    - Disruptions at three different tiers (node, regional, structural)
+    - Financial health and geographical risk indicators
+    - Viability constraints that can lead to irreversible collapse
+
+    Observation Space:
+    The observation is a flattened vector containing:
+    1. Inventory levels for all operational nodes (nodes × products)
+    2. In-transit shipments for all edges (edges × products)
+    3. Node stress levels (nodes)
+    4. Edge congestion levels (edges)
+    5. Disruption states for all nodes (nodes × 3 attributes)
+    6. Financial health of suppliers (suppliers)
+    7. Geographical risk for all nodes (nodes)
+
+    Action Space:
+    The environment supports both hierarchical and flattened action spaces:
+    - Hierarchical: (strategy, product_levels, routing_policy)
+    - Flattened: Discrete action space for DQN
+
+    Reward Function:
+    The reward is the negative of the total cost, which includes:
+    - Holding cost: Cost of maintaining inventory
+    - Stockout cost: Penalty for unmet demand
+    - Transportation cost: Cost of moving goods between nodes
+    """
+
+    def __init__(self, config_obj):
+        """
+        Initialize the supply chain environment.
+
+        Args:
+            config_obj: Configuration object with environment parameters
+        """
+        super().__init__()
+        self.config = config_obj
+        self._build_supply_chain_graph()
+        self.disruption_tier = 1
+        self._define_spaces()
+
+    def _build_supply_chain_graph(self):
+        """
+        Constructs the supply chain network using NetworkX.
+
+        The supply chain has four tiers:
+        1. Suppliers: Provide raw materials (infinite inventory)
+        2. Plants: Transform materials into products
+        3. Distribution Centers (DCs): Store products and fulfill customer orders
+        4. Customers: Generate demand for products
+
+        Each node is assigned to a geographical zone (NA, EU, AS) which affects
+        disruption propagation and transportation costs.
+        """
+        self.initial_G = nx.DiGraph()
+        self.node_types, self.node_zones = {}, {}
+
+        self.suppliers = [f'sup_{i}' for i in range(self.config.N_SUPPLIERS)]
+        self.plants = [f'plant_{i}' for i in range(self.config.N_PLANTS)]
+        self.dcs = [f'dc_{i}' for i in range(self.config.N_DCS)]
+        self.customers = [f'cust_{i}' for i in range(self.config.N_CUSTOMERS)]
+        self.operational_nodes = self.suppliers + self.plants + self.dcs
+
+        zones_dist = ['NA', 'NA', 'EU', 'EU', 'AS', 'AS']
+        for i, sup in enumerate(self.suppliers): self.node_zones[sup] = zones_dist[i % len(zones_dist)]
+        for i, plant in enumerate(self.plants): self.node_zones[plant] = 'NA' if i < 2 else 'EU'
+        for i, dc in enumerate(self.dcs): self.node_zones[dc] = 'NA' if i < 2 else 'EU'
+        for cust in self.customers: self.node_zones[cust] = 'NA'
+        self.unique_zones = sorted(list(set(self.node_zones.values())))
+
+        for n_type, n_list in [('supplier', self.suppliers), ('plant', self.plants), ('dc', self.dcs),
+                               ('customer', self.customers)]:
+            for node in n_list: self.node_types[node] = n_type
+
+        def add_edge(u, v, mean_lt, capacity):
+            shape = self.config.LEAD_TIME_GAMMA_SHAPE
+            scale = mean_lt / shape
+            self.initial_G.add_edge(u, v, mean_lead_time=mean_lt, lt_shape=shape, lt_scale=scale,
+                                    capacity=capacity, base_transport_cost=self.config.TRANSPORTATION_COST_RATE)
+
+        for sup in self.suppliers:
+            for plant in self.plants: add_edge(sup, plant, 8, 500)
+        for plant in self.plants:
+            for dc in self.dcs: add_edge(plant, dc, 4, 500)
+        for dc in self.dcs:
+            for cust in self.customers: add_edge(dc, cust, 2, 500)
+
+        self.initial_max_flow = self._calculate_max_flow(self.initial_G)
+
+    def _define_spaces(self):
+        obs_size = (len(self.operational_nodes) * self.config.N_PRODUCTS +
+                    len(self.initial_G.edges) * self.config.N_PRODUCTS +
+                    len(self.operational_nodes) +
+                    len(self.initial_G.edges) +
+                    len(self.operational_nodes) * 3 +
+                    len(self.suppliers) +
+                    len(self.operational_nodes))
+        self.observation_space = gym.spaces.Box(low=-1, high=np.inf, shape=(obs_size,), dtype=np.float32)
+
+        self.hierarchical_action_space = gym.spaces.Tuple((
+            gym.spaces.Discrete(3),
+            gym.spaces.MultiDiscrete([self.config.ACTION_LEVELS] * self.config.N_PRODUCTS),
+            gym.spaces.Discrete(2)
+        ))
+
+        # For DQN
+        self.flat_action_size = 3 * (self.config.ACTION_LEVELS ** self.config.N_PRODUCTS) * 2
+        self.action_space = gym.spaces.Discrete(self.flat_action_size)
+
+    def _unflatten_action(self, flat_action):
+        actions = []
+        # Unpack strategy
+        actions.append(flat_action % 3)
+        flat_action //= 3
+        # Unpack prod levels
+        prod_levels = []
+        for _ in range(self.config.N_PRODUCTS):
+            prod_levels.append(flat_action % self.config.ACTION_LEVELS)
+            flat_action //= self.config.ACTION_LEVELS
+        actions.append(np.array(prod_levels))
+        # Unpack route policy
+        actions.append(flat_action % 2)
+        return tuple(actions)
+
+    def reset(self, seed=None, options=None):
+        # Call the parent's reset method first
+        super().reset(seed=seed)
+
+        self.timestep = 0
+        # --- REMOVE THIS LINE ---
+        # self.disruption_tier = 1  # Default tier, can be changed by runner
+
+        self.G = self.initial_G.copy()
+        for u, v, d in self.G.edges(data=True):
+            d['current_transport_cost'] = d['base_transport_cost']
+
+        self.inventory = {n: np.zeros(self.config.N_PRODUCTS) for n in self.operational_nodes}
+        for sup in self.suppliers:
+            self.inventory[sup] = np.full(self.config.N_PRODUCTS,
+                                          1000 * self.config.MAX_STOCK_PER_PROD)  # Use large finite value instead of inf
+        self.in_transit = collections.defaultdict(lambda: collections.deque())
+
+        self.node_stress = {n: 0.0 for n in self.operational_nodes}
+        self.arc_congestion = {e: 0.0 for e in self.G.edges}
+        self.supplier_financial_health = {s: 1.0 for s in self.suppliers}
+        self.node_geo_risk = {n: self.np_random.uniform(0.1, 0.3) for n in self.operational_nodes}
+        self.consecutive_financial_distress = {s: 0 for s in self.suppliers}
+        self.consecutive_high_geo_risk = {n: 0 for n in self.operational_nodes}
+
+        self.disruption_state = {n: (0, 0.0, 0) for n in self.operational_nodes}
+        self.structural_shift_enacted = False
+
+        self.last_demand = {c: np.full(self.config.N_PRODUCTS, self.config.DEMAND_BASE) for c in self.customers}
+        self.last_demand_error = {c: np.zeros(self.config.N_PRODUCTS) for c in self.customers}
+
+        # Return the observation and an info dictionary
+        return self._get_obs(), {}
+
+    def _get_obs(self):
+        inv_flat = np.concatenate(
+            [self.inventory.get(n, np.zeros(self.config.N_PRODUCTS)) for n in self.operational_nodes])
+        transit_flat = np.zeros(len(self.initial_G.edges) * self.config.N_PRODUCTS)
+        edge_map = {e: i for i, e in enumerate(self.initial_G.edges)}
+        for (src, dst), shipments in self.in_transit.items():
+            if (src, dst) in edge_map:
+                for ship in shipments: transit_flat[edge_map[(src, dst)] * self.config.N_PRODUCTS + ship['product']] += \
+                    ship['quantity']
+        stress_flat = np.array([self.node_stress.get(n, 0) for n in self.operational_nodes])
+        congestion_flat = np.array([self.arc_congestion.get(e, 0) for e in self.initial_G.edges])
+        disruption_flat = np.array(
+            [list(self.disruption_state.get(n, (0, 0, 0))) for n in self.operational_nodes]).flatten()
+        fin_health_flat = np.array([self.supplier_financial_health.get(s, 0) for s in self.suppliers])
+        geo_risk_flat = np.array([self.node_geo_risk.get(n, 0) for n in self.operational_nodes])
+        return np.concatenate([inv_flat, transit_flat, stress_flat, congestion_flat,
+                               disruption_flat, fin_health_flat, geo_risk_flat]).astype(np.float32)
+
+    def step(self, action, is_hierarchical=False):
+        """Optimized step function with vectorized operations."""
+        self.timestep += 1
+
+        # Record previous state for disruption detection
+        last_disruption_state = self.disruption_state.copy()
+
+        # Process disruptions and viability updates
+        self._simulate_disruptions()
+        self._update_viability()
+
+        # Check for disruption events
+        disruption_event = any(
+            self.disruption_state[n][2] > 0 and last_disruption_state[n][2] == 0
+            for n in self.operational_nodes
+        )
+
+        # Process arrived shipments (vectorized where possible)
+        arrived_shipments = self._process_arrived_shipments()
+
+        # Update inventory with arrived shipments
+        for node, arrivals in arrived_shipments.items():
+            if node in self.inventory:
+                self.inventory[node] += arrivals
+
+        # Execute ordering strategy
+        hierarchical_action = action if is_hierarchical else self._unflatten_action(action)
+        transportation_cost, lead_time_data = self._execute_ordering_strategy(hierarchical_action)
+
+        # Generate and fulfill demand (vectorized)
+        demand = self._get_customer_demand()
+        total_demand, total_fulfilled, stockout_cost = self._fulfill_demand(demand)
+
+        # Calculate costs and reward
+        holding_cost = self._calculate_holding_cost()
+        reward = - (holding_cost + stockout_cost + transportation_cost)
+
+        # Check for irreversible state
+        viability_cost = self._calculate_viability_cost()
+        collapse_cost = self._check_irreversible_state()
+        terminated = collapse_cost == 1.0 or self.timestep >= self.config.MAX_TIMESTEPS
+
+        # Prepare info dictionary with both cost signals
+        info = {
+            'cost': collapse_cost,  # For backward compatibility with RS-PPO penalty
+            'viability_cost': viability_cost,  # The new signal for L-PPO
+            'service_level': total_fulfilled / total_demand if total_demand > 0 else 1.0,
+            'disruption_event': disruption_event,
+            'structural_shift_time': self.config.STRUCTURAL_SHIFT_TIME
+            if self.structural_shift_enacted and self.timestep == self.config.STRUCTURAL_SHIFT_TIME
+            else -1,
+            'holding_cost': holding_cost,
+            'stockout_cost': stockout_cost,
+            'transportation_cost': transportation_cost,
+            'lead_times': lead_time_data
+        }
+
+        return self._get_obs(), reward, terminated, False, info
+
+    def _process_arrived_shipments(self):
+        """Vectorized processing of arrived shipments."""
+        arrived_shipments = collections.defaultdict(lambda: np.zeros(self.config.N_PRODUCTS))
+
+        for (src, dst), shipments in self.in_transit.items():
+            # Update remaining time
+            for ship in shipments:
+                ship['remaining_time'] -= 1
+
+            # Process arrived shipments
+            while shipments and shipments[0]['remaining_time'] <= 0:
+                arrived = shipments.popleft()
+                if arrived['destination'] in self.G:
+                    arrived_shipments[arrived['destination']][arrived['product']] += arrived['quantity']
+
+        return arrived_shipments
+
+    def _fulfill_demand(self, demand):
+        """Vectorized demand fulfillment."""
+        total_demand = 0
+        total_fulfilled = 0
+        stockout_cost = 0
+
+        # Precompute available inventory at DCs
+        dc_inventory = np.zeros((len(self.dcs), self.config.N_PRODUCTS))
+        for i, dc in enumerate(self.dcs):
+            if dc in self.inventory:
+                dc_inventory[i] = self.inventory[dc]
+
+        # Process each customer
+        for cust in self.customers:
+            if cust not in self.G:
+                continue
+
+            # Get predecessors (DCs that supply this customer)
+            preds = list(self.G.predecessors(cust))
+            if not preds:
+                continue
+
+            # Calculate demand per DC
+            demand_per_dc = demand[cust] / len(preds)
+            total_demand += np.sum(demand_per_dc)
+
+            # Fulfill demand from each DC
+            for pred_dc in preds:
+                if pred_dc not in self.dcs:
+                    continue
+
+                # Find DC index
+                dc_idx = self.dcs.index(pred_dc)
+
+                # Calculate fulfillment
+                fulfilled = np.minimum(demand_per_dc, dc_inventory[dc_idx])
+                total_fulfilled += np.sum(fulfilled)
+
+                # Update inventory
+                dc_inventory[dc_idx] -= fulfilled
+                self.inventory[pred_dc] = dc_inventory[dc_idx]
+
+                # Calculate stockout cost
+                stockout = demand_per_dc - fulfilled
+                # Fix DeprecationWarning: ensure stockout_quantity is a python scalar
+                stockout_quantity = np.sum(stockout).item()
+                stockout_cost += stockout_quantity * self.config.STOCKOUT_PENALTY_RATE
+
+        return total_demand, total_fulfilled, stockout_cost
+
+    def _calculate_holding_cost(self):
+        """Vectorized holding cost calculation."""
+        total_inventory = 0
+        for node, inv in self.inventory.items():
+            if node in self.G and isinstance(inv, np.ndarray):
+                total_inventory += np.sum(inv)
+
+        return total_inventory * self.config.HOLDING_COST_RATE
+
+    def _execute_ordering_strategy(self, action):
+        order_strat, prod_levels_action, route_policy = action
+        transport_cost = 0
+        lead_time_logs = []
+        strat_multiplier = {0: 0.8, 1: 1.0, 2: 1.2}[order_strat]
+        target_inv_levels = {i: (l / (self.config.ACTION_LEVELS - 1)) * self.config.MAX_STOCK_PER_PROD for i, l in
+                             enumerate(prod_levels_action)}
+
+        for node in self.plants + self.dcs:
+            if node not in self.G: continue
+            incoming_supply = np.zeros(self.config.N_PRODUCTS)
+            for (src, dst), ships in self.in_transit.items():
+                if dst == node:
+                    for ship in ships: incoming_supply[ship['product']] += ship['quantity']
+            for prod_idx in range(self.config.N_PRODUCTS):
+                needed = strat_multiplier * (
+                        target_inv_levels[prod_idx] - self.inventory[node][prod_idx] - incoming_supply[prod_idx])
+                if needed <= 0: continue
+                potential_suppliers = [p for p in self.G.predecessors(node) if p in self.G]
+                if not potential_suppliers: continue
+
+                if route_policy == 0:
+                    best_supplier = min(potential_suppliers,
+                                        key=lambda s: self.G.edges[s, node].get('current_transport_cost', 999))
+                else:
+                    best_supplier = min(potential_suppliers, key=lambda s: self.G.edges[s, node]['mean_lead_time'])
+
+                _, severity, duration = self.disruption_state[best_supplier]
+                capacity_mult = 1.0 - severity if duration > 0 else 1.0
+                needed_val = float(np.array(needed).item())
+                inv_val = float(np.array(self.inventory[best_supplier][prod_idx]).item())
+                qty_to_ship = min(needed_val, inv_val) * capacity_mult
+
+
+                if qty_to_ship > 0:
+                    self.inventory[best_supplier][prod_idx] -= qty_to_ship
+                    edge_data = self.G.edges[best_supplier, node]
+                    lead_time = max(1, int(self.np_random.gamma(edge_data['lt_shape'], edge_data['lt_scale'])))
+                    lead_time_logs.append((edge_data['mean_lead_time'], lead_time))
+                    self.in_transit[(best_supplier, node)].append(
+                        {'product': prod_idx, 'quantity': qty_to_ship, 'remaining_time': lead_time,
+                         'destination': node})
+                    transport_cost += qty_to_ship * edge_data.get('current_transport_cost',
+                                                                  self.config.TRANSPORTATION_COST_RATE)
+        return transport_cost, lead_time_logs
+
+    def _get_customer_demand(self):
+        """
+        Generates customer demand using an ARIMA-like model.
+
+        The demand model includes:
+        - Autoregressive component: φ × D_{t-1}
+        - Moving average component: θ × ε_{t-1}
+        - Seasonality: A × sin(2πt/T)
+        - Noise: N(0, σ)
+
+        Returns:
+            Dictionary of demand arrays for each customer
+        """
+        demands = {}
+        for cust in self.customers:
+            seasonal = self.config.DEMAND_SEASONALITY_AMPLITUDE * math.sin(
+                2 * math.pi * self.timestep / self.config.DEMAND_SEASONALITY_PERIOD)
+            noise = self.np_random.normal(0, self.config.DEMAND_STD, self.config.N_PRODUCTS)
+            demand_t = (self.config.DEMAND_BASE +
+                        self.config.DEMAND_AUTOREGRESSIVE_COEF * self.last_demand[cust] +
+                        self.config.DEMAND_MA_COEF * self.last_demand_error[cust] + seasonal + noise)
+            demands[cust] = np.maximum(0, demand_t)
+            self.last_demand_error[cust] = noise
+            self.last_demand[cust] = demands[cust]
+        return demands
+
+    def _simulate_disruptions(self):
+        for node in self.operational_nodes:
+            type, severity, duration = self.disruption_state[node]
+            if duration > 0: self.disruption_state[node] = (type, severity, duration - 1)
+        if self.disruption_tier == 1:
+            self._simulate_tier1()
+        elif self.disruption_tier == 2:
+            self._simulate_tier2()
+        elif self.disruption_tier == 3:
+            self._simulate_tier2()
+            self._simulate_tier3()
+
+    def _simulate_tier1(self):
+        for n in self.operational_nodes:
+            if self.disruption_state[n][2] == 0 and self.np_random.random() < self.config.NODE_DISRUPTION_PROB:
+                self.disruption_state[n] = (1, 1.0, self.config.NODE_DISRUPTION_DURATION)
+
+    def _simulate_tier2(self):
+        for z in self.unique_zones:
+            if self.np_random.random() < self.config.REGIONAL_DISRUPTION_PROB:
+                mu, sig = self.config.SEVERITY_MEAN, self.config.SEVERITY_STD
+                sev = truncnorm.rvs((0 - mu) / sig, (1 - mu) / sig, loc=mu, scale=sig, random_state=self.np_random)
+                dur = geom.rvs(self.config.GEOM_P, random_state=self.np_random)
+                for n in self.operational_nodes:
+                    if self.node_zones.get(n) == z and self.disruption_state[n][2] == 0: self.disruption_state[n] = (2,
+                                                                                                                     sev,
+                                                                                                                     dur)
+
+    def _simulate_tier3(self):
+        if not self.structural_shift_enacted and self.timestep >= self.config.STRUCTURAL_SHIFT_TIME:
+            self.structural_shift_enacted = True
+            for u, v, d in self.G.edges(data=True):
+                if self.node_zones.get(u) != self.node_zones.get(v): d[
+                    'current_transport_cost'] *= self.config.INTERNATIONAL_COST_INCREASE_FACTOR
+            to_disable = [s for s in self.suppliers if self.node_zones.get(s) != self.config.FOCAL_ZONE]
+            if to_disable:
+                disabled = self.np_random.choice(to_disable, size=len(to_disable) // 2, replace=False)
+                for s in disabled:
+                    if s in self.G: self.G.remove_node(s)
+
+    def _update_viability(self):
+        for s in self.suppliers:
+            if s in self.G:
+                rate = -self.config.FINANCIAL_HEALTH_DECAY_RATE if self.node_stress.get(s,
+                                                                                        0) > 0.7 else self.config.FINANCIAL_HEALTH_RECOVERY_RATE
+                self.supplier_financial_health[s] = np.clip(self.supplier_financial_health[s] + rate, 0, 1)
+        for n in self.operational_nodes:
+            if n in self.G: self.node_geo_risk[n] = np.clip(
+                self.node_geo_risk[n] + self.np_random.uniform(-self.config.GEO_RISK_DRIFT, self.config.GEO_RISK_DRIFT),
+                0, 1)
+
+    def _check_irreversible_state(self):
+        for s in self.suppliers:
+            if s in self.G:
+                is_distressed = self.supplier_financial_health[s] < self.config.FINANCIAL_BANKRUPTCY_THRESHOLD
+                self.consecutive_financial_distress[s] = (self.consecutive_financial_distress[s] + 1) * is_distressed
+                if self.consecutive_financial_distress[s] >= self.config.FINANCIAL_DISTRESS_STEPS: self.G.remove_node(s)
+        for n in self.operational_nodes:
+            if n in self.G:
+                is_risky = self.node_geo_risk[n] > self.config.GEO_RISK_THRESHOLD
+                self.consecutive_high_geo_risk[n] = (self.consecutive_high_geo_risk[n] + 1) * is_risky
+                if self.consecutive_high_geo_risk[n] >= self.config.GEO_RISK_STEPS: self.G.remove_node(n)
+        if self.initial_max_flow > 0 and self._calculate_max_flow(
+                self.G) / self.initial_max_flow < self.config.CONNECTIVITY_COLLAPSE_THRESHOLD: return 1.0
+        return 0.0
+
+    def _calculate_max_flow(self, graph):
+        if not graph.nodes: return 0
+        flow_g = graph.copy()
+        s_src, s_snk = 'S_SRC', 'S_SNK'
+        flow_g.add_node(s_src)
+        flow_g.add_node(s_snk)
+        for s in [n for n in self.suppliers if n in flow_g]: flow_g.add_edge(s_src, s, capacity=float('inf'))
+        for c in [n for n in self.customers if n in flow_g]: flow_g.add_edge(c, s_snk, capacity=float('inf'))
+        try:
+            return nx.maximum_flow_value(flow_g, s_src, s_snk)
+        except nx.NetworkXError:
+            return 0
+
+    def _calculate_viability_cost(self):
+        """Calculates a normalized cost based on viability indicators."""
+        risky_nodes = 0
+        # Count suppliers in financial distress
+        for s in self.suppliers:
+            if s in self.G and self.supplier_financial_health[s] < self.config.FINANCIAL_BANKRUPTCY_THRESHOLD:
+                risky_nodes += 1
+        # Count nodes with high geopolitical risk
+        for n in self.operational_nodes:
+            if n in self.G and self.node_geo_risk[n] > self.config.GEO_RISK_THRESHOLD:
+                risky_nodes += 1
+
+        # Return a normalized cost between 0 and 1
+        return risky_nodes / len(self.operational_nodes) if self.operational_nodes else 0.0
+
+
+# --- Experiment Runner ---
+class ExperimentRunner:
+    def __init__(self, config_obj):
+        self.config = config_obj
+        self.env = SupplyChainEnv(config_obj)
+        self.agents = {
+            "l-ppo": LPPOAgent,
+            "rs-ppo": RSPPOAgent,
+            "dqn": DQNAgent,
+            "sp": SPAgent
+        }
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        self.output_dir = f"results_{timestamp}"
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # Setup logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(os.path.join(self.output_dir, 'experiment.log')),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+
+    def run(self):
+        results = []
+        for agent_name, AgentClass in self.agents.items():
+            for tier in [1, 2, 3]:
+                try:
+                    self.logger.info(f"--- Running Experiment: Agent={agent_name}, Tier={tier} ---")
+                    self.seed_all(self.config.SEED)
+                    self.env.disruption_tier = tier
+
+                    agent = AgentClass(self.env, self.config)
+
+                    training_rewards = None
+                    # Training phase (skip for SPAgent which is heuristic)
+                    if agent_name != "sp":
+                        self.logger.info("Training...")
+                        training_rewards = []
+                        all_inference_times = []
+                        for episode in range(self.config.NUM_TRAINING_EPISODES):
+                            try:
+                                state, _ = self.env.reset()
+                                episode_reward = 0
+                                for t in range(self.config.MAX_TIMESTEPS):
+                                    action, log_p, v_r, v_c = agent.select_action(state)
+                                    next_state, reward, term, _, info = self.env.step(
+                                        action, is_hierarchical=(agent_name != "dqn"))
+
+                                    episode_reward += reward
+
+                                    # Handle potential numerical issues
+                                    if not np.isfinite(reward):
+                                        self.logger.warning(f"Non-finite reward at episode {episode}, step {t}")
+                                        reward = 0.0
+
+                                    if agent_name == "dqn":
+                                        agent.replay_buffer.store(state, action, reward, next_state, term)
+                                        agent.update()
+                                    else:
+                                        collapse_signal = info.get('cost', 0.0)
+                                        viability_signal = info.get('viability_cost', 0.0)
+
+                                        if agent_name == "rs-ppo" and collapse_signal == 1.0:
+                                            reward += self.config.RS_PPO_PENALTY
+
+                                        # L-PPO learns from the continuous viability signal.
+                                        # All other agents learn from the sparse collapse signal.
+                                        cost_for_agent = viability_signal if agent_name == 'l-ppo' else collapse_signal
+
+                                        agent.store_transition(state, action, reward, term, cost_for_agent, log_p, v_r,
+                                                               v_c)
+                                        if len(agent.buffer['states']) >= self.config.ROLLOUT_STEPS:
+                                            agent.update(episode)
+                                            agent.clear_buffer()
+
+                                    state = next_state
+                                    if term:
+                                        break
+
+                                training_rewards.append(episode_reward)
+
+                            except Exception as e:
+                                self.logger.error(f"Error in training episode {episode}: {e}")
+                                continue
+
+                            if (episode + 1) % 20 == 0:
+                                self.logger.info(f"  Training ep {episode + 1}/{self.config.NUM_TRAINING_EPISODES}")
+
+                        try:
+                            model_path = os.path.join(self.output_dir, f"{agent_name}_tier{tier}.pt")
+                            agent.save(model_path)
+                        except Exception as e:
+                            self.logger.error(f"Failed to save model: {e}")
+
+                    # Evaluation
+                    self.logger.info("Evaluating...")
+                    eval_logs = []
+                    for i in range(self.config.NUM_EVALUATION_EPISODES):
+                        try:
+                            state, _ = self.env.reset()
+                            log = collections.defaultdict(list)
+                            episode_inference_times = []
+                            for t in range(self.config.MAX_TIMESTEPS):
+                                start_time = time.perf_counter()
+                                action, _, _, _ = agent.select_action(state)
+                                end_time = time.perf_counter()
+                                episode_inference_times.append(end_time - start_time)
+
+                                state, reward, term, _, info = self.env.step(
+                                    action, is_hierarchical=(agent_name != "dqn"))
+
+
+
+                                for k, v in info.items():
+                                    log[k].append(v)
+                                log['reward'].append(reward)
+                                log['timestep'].append(t)
+                                if term:
+                                    break
+
+                            if episode_inference_times:
+                                log['inference_time'] = [np.mean(episode_inference_times)]
+                            eval_logs.append(dict(log))
+                        except Exception as e:
+                            self.logger.error(f"Error in evaluation episode {i}: {e}")
+                            continue
+
+                    # Save evaluation logs
+                    try:
+                        log_filename = os.path.join(self.output_dir, f"eval_logs_{agent_name}_tier{tier}.pkl")
+                        with open(log_filename, "wb") as f:
+                            # noinspection PyTypeChecker
+                            pickle.dump(eval_logs, f)
+                    except Exception as e:
+                        self.logger.error(f"Failed to save evaluation logs: {e}")
+
+                    # Analysis
+                    try:
+                        training_data_for_analysis = training_rewards if agent_name != "sp" else None
+                        exp_results = self.analyze_logs(eval_logs, agent_name, tier, training_data_for_analysis)
+                        results.append(exp_results)
+                    except Exception as e:
+                        self.logger.error(f"Failed to analyze logs: {e}")
+
+                except Exception as e:
+                    self.logger.error(f"Failed to run experiment for agent {agent_name}, tier {tier}: {e}")
+                    continue
+
+        # Save results
+        try:
+            df_results = pd.DataFrame(results)
+            results_path = os.path.join(self.output_dir, "summary_results.csv")
+            df_results.to_csv(results_path, index=False)
+            self.logger.info("\n--- All Experiments Finished ---")
+            self.logger.info(f"Results saved to {results_path}")
+
+            # Generate plots
+            try:
+                create_detailed_plots(self.output_dir, self.config)
+                self.logger.info(f"Detailed plots generated successfully in: {self.output_dir}")
+            except Exception as e:
+                self.logger.error(f"Failed to generate detailed plots: {e}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to save results: {e}")
+            raise
+
+    def analyze_logs(self, logs, agent_name, tier, training_rewards=None):
+        """
+        Analyzes evaluation logs to calculate key performance metrics.
+
+        Metrics include:
+        - Time to Recover (TTR): Time taken to recover service level after disruption
+        - Time to Adapt (TTA): Time taken to adapt to structural changes
+        - Service Level: Percentage of demand fulfilled
+        - Collapse Probability: Probability of supply chain collapse
+        - Maturity Index: Composite measure of supply chain resilience
+        """
+        # Initialize metrics
+        metrics = {
+            'ttr_values': [], 'tta_values': [], 'adaptability_gaps': [],
+            'service_levels': [], 'total_rewards': [], 'collapse_events': 0,
+            'disruption_counts': [], 'lead_time_variances': [],
+            'recovery_success_rates': [], 'min_service_levels': [],
+            'service_level_stability': [], 'cost_components': [],
+            'cumulative_irreversibility_risk': [], 'post_tta_stability': [],
+            'inference_times': []
+        }
+
+        for log in logs:
+            # Extract data from log
+            service_level = np.array(log['service_level'])
+            rewards = np.array(log['reward'])
+            costs = np.array(log['cost'])
+            disruption_events = np.array(log['disruption_event'])
+            structural_shift_times = [t for t in log['structural_shift_time'] if t != -1]
+
+            # It calculates the average risk for the episode and stores it.
+            viability_costs = log.get('viability_cost', [])
+            if viability_costs:
+                metrics['cumulative_irreversibility_risk'].append(np.mean(viability_costs))
+
+            # Calculate basic metrics
+            metrics['service_levels'].append(np.mean(service_level) if len(service_level) > 0 else 0)
+            metrics['total_rewards'].append(np.sum(rewards))
+            metrics['min_service_levels'].append(np.min(service_level) if len(service_level) > 0 else 0)
+            metrics['disruption_counts'].append(np.sum(disruption_events))
+
+            if 'inference_time' in log:
+                metrics['inference_times'].extend(log['inference_time'])
+
+            all_lead_time_tuples = [item for sublist in log.get('lead_times', []) for item in sublist]
+            if all_lead_time_tuples:
+                # Variance is the mean of the squared differences
+                squared_errors = [(realized - mean) ** 2 for mean, realized in all_lead_time_tuples]
+                lead_time_variance = np.mean(squared_errors)
+                metrics['lead_time_variances'].append(lead_time_variance)
+
+            # Service level stability (rolling standard deviation)
+            if len(service_level) > 10:
+                rolling_std = [np.std(service_level[max(0, i - 10):i + 1]) for i in range(10, len(service_level))]
+                metrics['service_level_stability'].append(np.mean(rolling_std))
+
+            # Check for collapse
+            if np.any(costs > 0):
+                metrics['collapse_events'] += 1
+
+            # Calculate TTR for each disruption
+            ttr_values, recovery_successes = self._calculate_ttr(service_level, disruption_events)
+            metrics['ttr_values'].extend(ttr_values)
+
+            if ttr_values:
+                metrics['recovery_success_rates'].append(recovery_successes / len(ttr_values))
+            else:
+                metrics['recovery_success_rates'].append(0.0)
+
+            # Calculate TTA for structural shifts (Tier 3 only)
+            if tier == 3 and structural_shift_times:
+                tta_results = self._calculate_tta(service_level, structural_shift_times)
+
+                # Extract just the TTA durations for calculations
+                tta_values = [result['tta'] for result in tta_results]
+                metrics['tta_values'].extend(tta_values)
+
+                for result in tta_results:
+                    # If adaptation was successful, calculate post-TTA stability
+                    if result['adapt_time'] is not None:
+                        post_tta_slice = service_level[result['adapt_time']:]
+                        if len(post_tta_slice) > 1:
+                            stability = np.std(post_tta_slice)
+                            metrics['post_tta_stability'].append(stability)
+
+                # Calculate adaptability gap using the extracted tta_values
+                if ttr_values and tta_values:
+                    for tta in tta_values:
+                        if ttr_values:
+                            closest_ttr = min(ttr_values, key=lambda x: abs(x - tta))
+                            metrics['adaptability_gaps'].append(tta - closest_ttr)
+
+
+        # Calculate summary statistics with confidence intervals
+        summary = self._calculate_summary_statistics(metrics, len(logs))
+        summary.update({
+            'agent': agent_name,
+            'tier': tier,
+            'n_episodes': len(logs)
+        })
+
+        if training_rewards and len(training_rewards) > 50:  # Check if there's enough data
+            # Smooth the curve with a rolling average
+            rolling_avg_rewards = pd.Series(training_rewards).rolling(window=50, min_periods=10).mean().to_numpy()
+
+            # Find the peak performance
+            peak_performance = np.max(rolling_avg_rewards)
+
+            # Define the convergence threshold (e.g., 90% of the peak)
+            convergence_threshold = peak_performance * 0.9
+
+            # Find the first episode where the smoothed curve crosses this threshold
+            converged_episodes = np.where(rolling_avg_rewards >= convergence_threshold)[0]
+            if len(converged_episodes) > 0:
+                convergence_episode = converged_episodes[0]
+                # Convert to timesteps
+                summary['training_convergence_time'] = convergence_episode * self.config.MAX_TIMESTEPS
+            else:
+                # Agent never converged
+                summary['training_convergence_time'] = np.nan
+        else:
+            summary['training_convergence_time'] = np.nan
+
+        return summary
+
+    def _calculate_ttr(self, service_level, disruption_events):
+        """
+        Calculates Time to Recover (TTR) for each disruption event.
+
+        TTR is defined as the time from a disruption event until service level
+        returns to and stays above the threshold for a sustained period.
+        """
+        ttr_values = []
+        recovery_successes = 0
+        disruption_indices = np.where(disruption_events)[0]
+
+        for disruption_start in disruption_indices:
+            # Check if service level drops below threshold
+            below_threshold = service_level[disruption_start:] < self.config.SERVICE_LEVEL_THRESHOLD
+
+            if not np.any(below_threshold):
+                # No significant drop, skip this disruption
+                continue
+
+            drop_time = disruption_start + np.argmax(below_threshold).item()
+
+            # Find recovery point (service level returns and stays above threshold)
+            recovery_time = None
+            for i in range(drop_time + 1, len(service_level)):
+                # Check if service level has recovered and stabilized
+                window = service_level[i:min(i + self.config.TTA_STABILITY_WINDOW, len(service_level))]
+
+                if (len(window) >= self.config.TTA_STABILITY_WINDOW / 2 and  # At least half the window
+                        np.mean(window) >= self.config.SERVICE_LEVEL_THRESHOLD and  # Above threshold
+                        np.all(window >= self.config.SERVICE_LEVEL_THRESHOLD * 0.8)):  # Not too volatile
+
+                    recovery_time = i
+                    break
+
+            if recovery_time is not None:
+                ttr = recovery_time - disruption_start
+                ttr_values.append(ttr)
+                recovery_successes += 1
+            else:
+                # If no recovery, use maximum possible TTR
+                ttr_values.append(len(service_level) - disruption_start)
+
+        return ttr_values, recovery_successes
+
+    def _calculate_tta(self, service_level, structural_shift_times):
+        """
+        Calculates Time to Adapt (TTA) for structural shifts.
+
+        TTA is defined as the time from a structural shift until the supply chain
+        adapts and service level stabilizes at an acceptable level.
+        """
+        tta_results = []
+
+        for shift_time in structural_shift_times:
+            if shift_time >= len(service_level):
+                continue
+
+            # Find when service level stabilizes after shift
+            adaptation_time = None
+            for i in range(shift_time + 1, len(service_level)):
+                # Check stability in a window
+                window = service_level[i:min(i + self.config.TTA_STABILITY_WINDOW, len(service_level))]
+
+                if len(window) < self.config.TTA_STABILITY_WINDOW / 2:
+                    # Not enough data points
+                    continue
+
+                # Check if service level has stabilized
+                is_stable = (
+                        np.std(window) < 0.05 and  # Low variability
+                        np.mean(window) > self.config.SERVICE_LEVEL_THRESHOLD - 0.1 and  # Acceptable level
+                        np.min(window) > self.config.SERVICE_LEVEL_THRESHOLD - 0.15  # No severe drops
+                )
+
+                if is_stable:
+                    adaptation_time = i
+                    break
+
+            if adaptation_time is not None:
+                tta = adaptation_time - shift_time
+                tta_results.append({'tta': tta, 'adapt_time': adaptation_time})
+            else:
+                # If no adaptation, adaptation time is None
+                max_tta = len(service_level) - shift_time
+                tta_results.append({'tta': max_tta, 'adapt_time': None})
+
+        return tta_results
+
+    def _calculate_summary_statistics(self, metrics, n_episodes):
+        """
+        Calculates summary statistics with confidence intervals.
+        """
+
+        def ci(data, confidence=0.95):
+            if not data or len(data) < 2:
+                return np.nan, np.nan, np.nan
+            mean = np.mean(data)
+            sem = np.std(data) / np.sqrt(len(data))
+            h = sem * 1.96  # 95% confidence interval
+            return mean, mean - h, mean + h
+
+        summary = {}
+
+        # Calculate confidence intervals for key metrics
+        for metric_name in ['service_levels', 'ttr_values', 'tta_values',
+                            'adaptability_gaps', 'lead_time_variances',
+                            'min_service_levels', 'service_level_stability',
+                            'cumulative_irreversibility_risk', 'post_tta_stability',
+                            'inference_times']:
+            mean, ci_lower, ci_upper = ci(metrics.get(metric_name, []))
+            summary[f'avg_{metric_name}'] = mean
+            summary[f'{metric_name}_ci_lower'] = ci_lower
+            summary[f'{metric_name}_ci_upper'] = ci_upper
+
+        # Other metrics
+        summary['avg_reward'] = np.mean(metrics['total_rewards']) if metrics['total_rewards'] else 0
+        summary['prob_collapse'] = metrics['collapse_events'] / n_episodes
+        summary['avg_disruptions'] = np.mean(metrics['disruption_counts']) if metrics['disruption_counts'] else 0
+        summary['recovery_rate'] = np.mean(metrics['recovery_success_rates']) if metrics[
+            'recovery_success_rates'] else 0
+
+        return summary
+
+    def seed_all(self, seed):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        self.env.reset(seed=seed)
+
+
+def create_detailed_plots(results_dir, config_obj):
+    """
+    Generates detailed time-series and box plots from raw evaluation logs.
+    """
+    sns.set_theme(style="whitegrid")
+    agents = ["l-ppo", "rs-ppo", "dqn", "sp"]
+    tiers = [1, 2, 3]
+    if not os.path.exists(results_dir):
+        print(f"Results directory not found: {results_dir}")
+        return
+
+    # Load all raw evaluation log files
+    all_logs = {}
+    for agent in agents:
+        all_logs[agent] = {}
+        for tier in tiers:
+            log_path = os.path.join(results_dir, f"eval_logs_{agent}_tier{tier}.pkl")
+            if os.path.exists(log_path):
+                with open(log_path, 'rb') as f:
+                    all_logs[agent][tier] = pickle.load(f)
+
+    # --- 1. TIME-SERIES PLOTS ---
+    time_series_kpis = {
+        'service_level': 'Service Level Over Time',
+        'viability_cost': 'Cumulative Irreversibility Risk Over Time'
+    }
+
+    for kpi, title in time_series_kpis.items():
+        fig, axes = plt.subplots(1, 3, figsize=(24, 7), sharey=True)
+        fig.suptitle(title, fontsize=20)
+
+        for i, tier in enumerate(tiers):
+            ax = axes[i]
+            for agent in agents:
+                if tier in all_logs.get(agent, {}):
+                    episode_data = [log[kpi] for log in all_logs[agent][tier] if kpi in log and log[kpi]]
+                    if not episode_data: continue
+
+                    max_len = config_obj.MAX_TIMESTEPS
+                    padded_data = [np.pad(d, (0, max_len - len(d)), 'edge') for d in episode_data]
+                    df = pd.DataFrame(padded_data)
+
+                    mean = df.mean(axis=0)
+                    std = df.std(axis=0)
+
+                    ax.plot(mean.index, mean, label=agent.upper())
+                    ax.fill_between(mean.index, mean - std, mean + std, alpha=0.2)
+
+            ax.set_title(f'Tier {tier}')
+            ax.set_xlabel('Timestep')
+            if i == 0:
+                ax.set_ylabel(kpi.replace('_', ' ').title())
+            ax.legend()
+            ax.set_xlim(0, config_obj.MAX_TIMESTEPS)
+
+        plt.tight_layout(rect=(0, 0.03, 1, 0.95))
+        plt.savefig(os.path.join(results_dir, f'timeseries_{kpi}.png'), dpi=300)
+        plt.close(fig)
+
+    print(f"Generated time-series plots for: {', '.join(time_series_kpis.keys())}")
+
+    # --- 2. BOX PLOTS ---
+    # Helper function to calculate per-episode metrics from logs
+    def get_episode_values(logs, kpi_name):
+        all_values = []
+        for log in logs:
+            if kpi_name == 'total_reward':
+                all_values.append(np.sum(log.get('reward', [])))
+            elif kpi_name == 'min_service_level':
+                all_values.append(np.min(log.get('service_level', [0])))
+            # Add other per-episode calculations here if needed
+        return all_values
+
+    episode_kpis_to_plot = {
+        'total_reward': 'Distribution of Total Rewards',
+        'min_service_level': 'Distribution of Minimum Service Levels',
+        # These KPIs are already lists of events within the log, so they are handled differently
+        'ttr_values': 'Distribution of Time-to-Recover (TTR)',
+        'lead_time_variances': 'Distribution of Lead Time Variance'
+    }
+
+    for kpi, title in episode_kpis_to_plot.items():
+        plot_data = []
+        for tier in tiers:
+            for agent in agents:
+                if tier in all_logs.get(agent, {}):
+                    logs_for_exp = all_logs[agent][tier]
+                    if kpi in ['total_reward', 'min_service_level']:
+                        values = get_episode_values(logs_for_exp, kpi)
+                    else:  # For metrics that are lists of events
+                        values_nested = [log.get(kpi, []) for log in logs_for_exp]
+                        values = [item for sublist in values_nested for item in sublist]
+
+                    for v in values:
+                        plot_data.append({'Agent': agent.upper(), 'Tier': f'Tier {tier}', 'Value': v})
+
+        if not plot_data: continue
+        df_plot = pd.DataFrame(plot_data)
+
+        plt.figure(figsize=(16, 9))
+        sns.boxplot(x='Agent', y='Value', hue='Tier', data=df_plot)
+        plt.title(title, fontsize=16)
+        plt.ylabel(kpi.replace('_', ' ').title())
+        plt.xlabel('Agent')
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_dir, f'boxplot_{kpi}.png'), dpi=300)
+        plt.close()
+
+    print(f"Generated box plots for: {', '.join(episode_kpis_to_plot.keys())}")
+
+if __name__ == '__main__':
+    try:
+        config = Config()
+        runner = ExperimentRunner(config)
+        runner.run()
+
+        # Generate new detailed plots from the raw logs
+        try:
+            create_detailed_plots(runner.output_dir, config)
+            print("Detailed plots generated successfully in:", runner.output_dir)
+        except Exception as e:
+            print(f"Failed to generate detailed plots: {e}")
+
+    except Exception as e:
+        logging.error(f"Experiment failed with error: {e}")
+        raise
